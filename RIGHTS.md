@@ -13,7 +13,7 @@ No new noncommercial license is adopted by this notice.
 Portions derived from the upstream Strategic Signal Scanner retain their
 existing MIT permissions. The upstream notice, including its copyright
 attribution, is reproduced verbatim in
-[LICENSE-MIT-UPSTREAM.txt](LICENSE-MIT-UPSTREAM.txt).
+[LICENSE-MIT-UPSTREAM.txt](third_party/LICENSE-MIT-UPSTREAM.txt).
 This rights statement does not revoke, narrow, or supersede those permissions.
 The upstream notice must accompany copies or substantial portions of that
 MIT-covered software.

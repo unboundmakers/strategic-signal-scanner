@@ -57,4 +57,4 @@ Vertex 主路径显式设置 GEMINI_BACKEND=vertex、项目、区域和模型，
 ## 权利说明
 
 原创与新增部分未授予使用或商用许可，商业使用需要事先书面授权；既有上游 MIT
-部分的授权不变。见 [RIGHTS.md](RIGHTS.md) 与[上游声明](LICENSE-MIT-UPSTREAM.txt)。
+部分的授权不变。见 [RIGHTS.md](RIGHTS.md) 与[上游声明](third_party/LICENSE-MIT-UPSTREAM.txt)。

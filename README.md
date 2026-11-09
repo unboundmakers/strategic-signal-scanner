@@ -70,4 +70,4 @@ lock or generation preconditions, so operators must serialize writes.
 
 Original/new contributions reserve all rights; commercial use requires prior
 written permission. Existing MIT permissions on upstream portions remain in
-effect. See [RIGHTS.md](RIGHTS.md) and the [upstream notice](LICENSE-MIT-UPSTREAM.txt).
+effect. See [RIGHTS.md](RIGHTS.md) and the [upstream notice](third_party/LICENSE-MIT-UPSTREAM.txt).
