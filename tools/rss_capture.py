@@ -1,0 +1,215 @@
+#!/usr/bin/env python3
+"""Capture real RSS / Atom / web source entries into a canonical article JSON file."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+from typing import Any
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_DIR = SCRIPT_DIR.parent
+if str(REPO_DIR) not in sys.path:
+    sys.path.insert(0, str(REPO_DIR))
+
+from fetcher import fetch_articles, fetch_fixture
+from sources import DEFAULT_ITEMS_PER_FEED, SOURCE_GROUPS, get_feeds
+from state import (
+    CaptureState,
+    article_dedupe_keys,
+    load_state,
+    mark_source_success,
+    remember_article,
+    save_state,
+    source_is_fresh,
+)
+
+LOCAL_TZ = timezone(timedelta(hours=8))
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Capture RSS / Atom entries")
+    parser.add_argument(
+        "--items-per-feed",
+        type=int,
+        default=DEFAULT_ITEMS_PER_FEED,
+        help="Newest items to keep from each feed.",
+    )
+    parser.add_argument(
+        "--max-articles",
+        type=int,
+        default=None,
+        help="Optional total cap across all feeds.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="artifacts/rss",
+        help="Directory to save the captured JSON.",
+    )
+    parser.add_argument(
+        "--group",
+        type=str,
+        default="all",
+        choices=tuple(SOURCE_GROUPS),
+        help="Source group to capture.",
+    )
+    parser.add_argument(
+        "--ignore-state",
+        action="store_true",
+        help="Ignore seen-url and refresh-window state for this run.",
+    )
+    inputs = parser.add_mutually_exclusive_group(required=True)
+    inputs.add_argument("--fixture-feed", help="Local synthetic RSS/Atom XML; never downloads.")
+    inputs.add_argument("--allow-network", action="store_true", help="Explicitly permit live source capture.")
+    args = parser.parse_args()
+    if args.items_per_feed < 0 or (args.max_articles is not None and args.max_articles < 0):
+        parser.error("capture limits cannot be negative")
+    return args
+
+
+def main() -> int:
+    args = parse_args()
+    out_dir = Path(args.output_dir)
+    if not out_dir.is_absolute():
+        out_dir = REPO_DIR / out_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    state, state_path = load_state(REPO_DIR)
+
+    print("Capturing sources...", flush=True)
+    feeds = get_feeds(args.group) if not args.fixture_feed else []
+    if not args.ignore_state:
+        feeds = _filter_feeds_by_state(feeds, state)
+    articles = fetch_fixture(
+        _resolve_fixture(args.fixture_feed), args.items_per_feed, args.max_articles
+    ) if args.fixture_feed else fetch_articles(
+        feeds,
+        items_per_feed=args.items_per_feed,
+        max_articles=args.max_articles,
+    )
+    print(f"Captured {len(articles)} articles.", flush=True)
+
+    kept_articles = _dedupe_against_state(articles, state, args.ignore_state)
+    print(f"Deduped to {len(kept_articles)} new articles.", flush=True)
+
+    date_str = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d")
+    out_path = out_dir / f"raw_{date_str}.json"
+    payload = json.dumps(kept_articles, ensure_ascii=False, indent=2)
+
+    out_path.write_text(payload, encoding="utf-8")
+    print(f"Saved: {out_path}", flush=True)
+
+    if not args.ignore_state:
+        _update_state_from_articles(state, feeds, kept_articles)
+        for article in kept_articles:
+            remember_article(state, article)
+        saved_state = save_state(state, REPO_DIR)
+        print(f"State saved: {saved_state}", flush=True)
+    return 0
+
+
+def _filter_feeds_by_state(feeds: list[dict[str, Any]], state: CaptureState) -> list[dict[str, Any]]:
+    filtered: list[dict[str, Any]] = []
+    now = datetime.now(LOCAL_TZ)
+    for feed in feeds:
+        if not isinstance(feed, dict):
+            filtered.append(feed)
+            continue
+        refresh_hours = feed.get("refresh_hours")
+        source_name = str(feed.get("name", "")).strip()
+        feed_url = str(feed.get("url", "")).strip()
+        source_key = _source_key(source_name, feed_url)
+        try:
+            refresh_value = float(refresh_hours) if refresh_hours is not None else None
+        except (TypeError, ValueError):
+            refresh_value = None
+        if refresh_value is not None:
+            source_state = state.sources.get(source_key, {})
+            if source_is_fresh(source_state, refresh_value, now=now):
+                print(f"Skipping fresh source: {source_name} (refresh window not elapsed)", flush=True)
+                continue
+        filtered.append(feed)
+    return filtered
+
+
+def _dedupe_against_state(articles: list[dict[str, Any]], state: CaptureState, ignore_state: bool) -> list[dict[str, Any]]:
+    if ignore_state:
+        return articles
+
+    deduped: list[dict[str, Any]] = []
+    seen_urls: set[str] = set(state.seen_urls.keys())
+    seen_title_hashes: set[str] = set(state.seen_title_hashes.keys())
+    seen_content_hashes: set[str] = set(state.seen_content_hashes.keys())
+
+    for article in articles:
+        if not isinstance(article, dict):
+            continue
+        keys = article_dedupe_keys(article)
+        url = keys.get("url", "")
+        title_hash = keys.get("title_hash", "")
+        content_hash = keys.get("content_hash", "")
+        if url and url in seen_urls:
+            continue
+        if title_hash and title_hash in seen_title_hashes:
+            continue
+        if content_hash and content_hash in seen_content_hashes:
+            continue
+        if url:
+            seen_urls.add(url)
+        if title_hash:
+            seen_title_hashes.add(title_hash)
+        if content_hash:
+            seen_content_hashes.add(content_hash)
+        deduped.append(article)
+    return deduped
+
+
+def _update_state_from_articles(state: CaptureState, feeds: list[dict[str, Any]], articles: list[dict[str, Any]]) -> None:
+    by_source: dict[str, list[dict[str, str]]] = {}
+    for article in articles:
+        if not isinstance(article, dict):
+            continue
+        source_name = str(article.get("source", "")).strip()
+        feed_url = str(article.get("feed_url", "")).strip()
+        source_key = _source_key(source_name, feed_url)
+        by_source.setdefault(source_key, []).append(
+            {
+                "url": str(article.get("url", "")).strip(),
+                "published": str(article.get("published", "")).strip(),
+            }
+        )
+    for feed in feeds:
+        if not isinstance(feed, dict):
+            continue
+        source_name = str(feed.get("name", "")).strip()
+        feed_url = str(feed.get("url", "")).strip()
+        source_key = _source_key(source_name, feed_url)
+        source_articles = by_source.get(source_key, [])
+        urls = [item.get("url", "") for item in source_articles if item.get("url", "")]
+        latest_url = source_articles[0].get("url", "") if source_articles else ""
+        latest_published = source_articles[0].get("published", "") if source_articles else ""
+        mark_source_success(
+            state,
+            source_key,
+            source_name,
+            feed_url,
+            urls,
+            latest_url=latest_url,
+            latest_published=latest_published,
+        )
+
+
+def _source_key(source_name: str, feed_url: str) -> str:
+    return f"{source_name}::{feed_url}".strip()
+
+
+def _resolve_fixture(raw: str) -> Path:
+    path = Path(raw)
+    return path if path.is_absolute() else REPO_DIR / path
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
